@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
-from einops import reduce
+from diffusers.image_processor import VaeImageProcessor
 
 device = "cuda:0"
 
@@ -85,11 +85,11 @@ class PerfusionAttnProcessor(nn.Module):
             key = attn.to_k(encoder_hidden_states)
             value = attn.to_v(encoder_hidden_states)
 
-        if crossattn:
-            detach = torch.ones_like(key)
-            detach[:, :1, :] = detach[:, :1, :] * 0.0
-            key = detach * key + (1 - detach) * key.detach()
-            value = detach * value + (1 - detach) * value.detach()
+        # if crossattn:
+        #     detach = torch.ones_like(key)
+        #     detach[:, :1, :] = detach[:, :1, :] * 0.0
+        #     key = detach * key + (1 - detach) * key.detach()
+        #     value = detach * value + (1 - detach) * value.detach()
 
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)
@@ -184,7 +184,6 @@ class PerfusionModel(nn.Module):
             return self.unet(noisy_latents, 
                             timesteps, 
                             torch.cat([enc_with_new_concept, uncond_enc]),
-                            enc_with_new_concept,
                             cross_attention_kwargs={
                                 'text_enc_with_superclass': enc_with_superclass,
                                 'concept_indices': concept_indices,
@@ -196,14 +195,19 @@ def open_and_prepare_images(dir):
     image_paths = os.listdir(dir)
     image_paths = [dir + "/" + f for f in image_paths]
     images = []
+    img_proc = VaeImageProcessor()
     for path in image_paths:
         image = Image.open(path)
-        # image = image.convert("RGB")
-        image = image.resize((512, 512))
-        image = np.array(image).astype(np.uint8)
-        image = (image / 127.5 - 1.0).astype(np.float32)
-        images.append(torch.from_numpy(image).permute(2, 0, 1))
-    return images
+        image = img_proc.resize(image, 512, 512)
+        # # image = image.convert("RGB")
+        # image = image.resize((512, 512))
+        # image = np.array(image).astype(np.uint8)
+        # image = (image / 127.5 - 1.0).astype(np.float32)
+        # images.append(torch.from_numpy(image).permute(2, 0, 1))
+        images.append(image)
+    images = img_proc.pil_to_numpy(images)
+    images = img_proc.numpy_to_pt(images)
+    return images.to(device)
 
 def train(dataloader, model, num_steps, vae, noise_scheduler, opt):
     i = 0
@@ -268,7 +272,7 @@ if __name__ == "__main__":
     # clip_model, _, _ = open_clip.create_model_and_transforms("ViT-L-14", pretrained='laion2B-s32B-b82K')
     tokenizer = CLIPTokenizer.from_pretrained(model_name, subfolder='tokenizer')
     clip_model = CLIPTextModel.from_pretrained(model_name, subfolder='text_encoder')
-    images = open_and_prepare_images("./dog")
+    images = open_and_prepare_images("../dog")
     
     dl = DataLoader(list(zip(images, ["a photo of a dog sitting"]*len(images))), 2, True)
     superclass_string = "dog"
@@ -280,7 +284,7 @@ if __name__ == "__main__":
     
     perfusion_model.train()
     train(dl, perfusion_model, 1500, vae, noise_scheduler, opt)
-    save_load.save(perfusion_model, 'dog_concept.pt')   
+    # save_load.save(perfusion_model, 'dog_concept.pt')   
     # save_load.load(perfusion_model, 'dog_concept.pt')
     perfusion_model.eval()
     images = inference("a photo of a dog with sunglasses on", perfusion_model, noise_scheduler, 100)
