@@ -1,7 +1,7 @@
 import torch
 from perfusion_pytorch import Rank1EditModule, save_load, OpenClipEmbedWrapper, EmbeddingWrapper
 from perfusion_pytorch.optimizer import get_finetune_optimizer, get_finetune_parameters
-from diffusers import AutoencoderKL, LMSDiscreteScheduler, UNet2DConditionModel, DDPMScheduler
+from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, StableDiffusionPipeline
 from PIL import Image
 from torch import nn
 from diffusers.models.attention_processor import Attention
@@ -238,32 +238,44 @@ def train(dataloader, model, num_steps, vae, noise_scheduler, opt):
             pbar.set_description(f"Loss: {loss.item()/len(images)}")
             i += len(images)
             
-def inference(prompt, model, scheduler, num_inference_steps, num_images=4, guidance_scale = 7.5):
-    scheduler.set_timesteps(num_inference_steps)
-    latents = torch.randn((num_images, model.unet.config.in_channels, 512 // 8, 512 // 8))
-    latents = latents * scheduler.init_noise_sigma
-    latents = latents.to(device)
-    for t in tqdm(scheduler.timesteps):
-        latent_model_input = torch.cat([latents]*2)
-        latent_model_input = scheduler.scale_model_input(latent_model_input, timestep=t)
-        with torch.no_grad():
-            t = t.to(device)
-            noise_pred = model(latent_model_input, t, [prompt]*num_images)
+# def inference(prompt, model, scheduler, num_inference_steps, num_images=4, guidance_scale = 7.5):
+#     scheduler.set_timesteps(num_inference_steps)
+#     latents = torch.randn((num_images, model.unet.config.in_channels, 512 // 8, 512 // 8))
+#     latents = latents * scheduler.init_noise_sigma
+#     latents = latents.to(device)
+#     for t in tqdm(scheduler.timesteps):
+#         latent_model_input = torch.cat([latents]*2)
+#         latent_model_input = scheduler.scale_model_input(latent_model_input, timestep=t)
+#         with torch.no_grad():
+#             t = t.to(device)
+#             noise_pred = model(latent_model_input, t, [prompt]*num_images)
         
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-        latents = scheduler.step(noise_pred, t, latents).prev_sample
+#         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+#         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+#         latents = scheduler.step(noise_pred, t, latents).prev_sample
         
-    latents = 1 / 0.18215 * latents
-    with torch.no_grad():
-        image = vae.decode(latents).sample
+#     latents = 1 / 0.18215 * latents
+#     with torch.no_grad():
+#         image = vae.decode(latents).sample
 
-    image = (image / 2 + 0.5).clamp(0, 1)
-    image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-    images = (image * 255).round().astype("uint8")
-    pil_images = [Image.fromarray(image) for image in images]
+#     image = (image / 2 + 0.5).clamp(0, 1)
+#     image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+#     images = (image * 255).round().astype("uint8")
+#     pil_images = [Image.fromarray(image) for image in images]
     
-    return pil_images
+#     return pil_images
+
+def inference(prompts, pipe, perfusion_model):
+    _, superclass_enc, _, indices = perfusion_model.wrapped_embeds(prompts)
+    pipe.unet = perfusion_model.unet
+    pipe.text_encoder = perfusion_model.clip_model
+    pipe.to(device)
+    images = pipe(prompts, 
+                 num_inference_steps=30, 
+                 guidance_scale=7.5, 
+                 cross_attention_kwargs={"concept_indices": indices, "text_enc_with_superclass": superclass_enc}).images
+    return images
+    
     
 if __name__ == "__main__":
     model_name = "runwayml/stable-diffusion-v1-5"
@@ -286,11 +298,14 @@ if __name__ == "__main__":
     opt = get_finetune_optimizer(perfusion_model)
     
     perfusion_model.train()
-    train(dl, perfusion_model, 5000, vae, noise_scheduler, opt)
+    train(dl, perfusion_model, 1200, vae, noise_scheduler, opt)
     save_load.save(perfusion_model, 'dog_concept.pt')   
     # save_load.load(perfusion_model, 'dog_concept.pt')
     perfusion_model.eval()
-    images = inference("a photo of a dog with sunglasses on", perfusion_model, noise_scheduler, 100)
+    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", requires_safety_checker=False)
+    images = inference(['a photo of a dog, high quality']*4, pipe, perfusion_model)
+    # images = inference("a photo of a dog with sunglasses on", perfusion_model, noise_scheduler, 100)
+    
     
     for i, img in enumerate(images):
         img.save(f"image{i}.jpg")
