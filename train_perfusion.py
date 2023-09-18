@@ -85,11 +85,11 @@ class PerfusionAttnProcessor(nn.Module):
             key = attn.to_k(encoder_hidden_states)
             value = attn.to_v(encoder_hidden_states)
 
-        # if crossattn:
-        #     detach = torch.ones_like(key)
-        #     detach[:, :1, :] = detach[:, :1, :] * 0.0
-        #     key = detach * key + (1 - detach) * key.detach()
-        #     value = detach * value + (1 - detach) * value.detach()
+        if crossattn:
+            detach = torch.ones_like(key)
+            detach[:, :1, :] = detach[:, :1, :] * 0.0
+            key = detach * key + (1 - detach) * key.detach()
+            value = detach * value + (1 - detach) * value.detach()
 
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)
@@ -116,7 +116,11 @@ class PerfusionModel(nn.Module):
         
         # self.unet.requires_grad_(False)
         # self.clip_model.requires_grad_(False)
-        self.l_tokenizer = lambda x: tokenizer(x, padding="max_length", return_tensors='pt')['input_ids']
+        self.l_tokenizer = lambda x: tokenizer(x, 
+                                               padding="max_length", 
+                                               max_length=tokenizer.model_max_length, 
+                                               truncation=True,
+                                               return_tensors='pt')['input_ids']
         self.wrapped_embeds = EmbeddingWrapper(clip_model.get_input_embeddings(), 
                                           superclass_string=self.superclass_string, 
                                           tokenize=self.l_tokenizer, 
@@ -169,7 +173,7 @@ class PerfusionModel(nn.Module):
             enc_with_superclass = embeds_with_superclass
             
         if self.training:
-            return self.unet(noisy_latents, 
+            out = self.unet(noisy_latents, 
                             timesteps, 
                             enc_with_new_concept,
                             cross_attention_kwargs={
@@ -177,19 +181,20 @@ class PerfusionModel(nn.Module):
                                 'concept_indices': concept_indices,
                                 },
                             attention_mask=embed_mask,
-                            ).sample
+                            )
         else:
             uncond_ids = self.l_tokenizer([""]*enc_with_new_concept.shape[0])
             uncond_enc = self.clip_model(uncond_ids.to(noisy_latents.device))[0]
-            return self.unet(noisy_latents, 
+            out = self.unet(noisy_latents, 
                             timesteps, 
-                            torch.cat([enc_with_new_concept, uncond_enc]),
+                            torch.cat([uncond_enc, enc_with_new_concept]),
                             cross_attention_kwargs={
                                 'text_enc_with_superclass': enc_with_superclass,
                                 'concept_indices': concept_indices,
                                 },
                             attention_mask=torch.cat([embed_mask, torch.ones_like(embed_mask, dtype=embed_mask.dtype)])
-                            ).sample
+                            )
+        return out.sample
 
 def open_and_prepare_images(dir):
     image_paths = os.listdir(dir)
@@ -217,7 +222,6 @@ def train(dataloader, model, num_steps, vae, noise_scheduler, opt):
             opt.zero_grad()
             images, text = batch
             text = list(text)
-            images = images.to(device)
             with torch.no_grad():
                 latents = vae.encode(images).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
@@ -228,7 +232,6 @@ def train(dataloader, model, num_steps, vae, noise_scheduler, opt):
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             out = model(noisy_latents, timesteps, text)
             loss = F.mse_loss(out, noise, reduction="mean")
-            # loss = reduce(loss, 'b c h w -> b h w', 'mean')
             loss.backward()
             opt.step()
             pbar.update(len(images))
@@ -240,8 +243,8 @@ def inference(prompt, model, scheduler, num_inference_steps, num_images=4, guida
     latents = torch.randn((num_images, model.unet.config.in_channels, 512 // 8, 512 // 8))
     latents = latents * scheduler.init_noise_sigma
     latents = latents.to(device)
-    for i, t in tqdm(enumerate(scheduler.timesteps), total=len(scheduler.timesteps)):
-        latent_model_input = torch.cat([latents]* 2)
+    for t in tqdm(scheduler.timesteps):
+        latent_model_input = torch.cat([latents]*2)
         latent_model_input = scheduler.scale_model_input(latent_model_input, timestep=t)
         with torch.no_grad():
             t = t.to(device)
@@ -283,8 +286,8 @@ if __name__ == "__main__":
     opt = get_finetune_optimizer(perfusion_model)
     
     perfusion_model.train()
-    train(dl, perfusion_model, 1500, vae, noise_scheduler, opt)
-    # save_load.save(perfusion_model, 'dog_concept.pt')   
+    train(dl, perfusion_model, 5000, vae, noise_scheduler, opt)
+    save_load.save(perfusion_model, 'dog_concept.pt')   
     # save_load.load(perfusion_model, 'dog_concept.pt')
     perfusion_model.eval()
     images = inference("a photo of a dog with sunglasses on", perfusion_model, noise_scheduler, 100)
