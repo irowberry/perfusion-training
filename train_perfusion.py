@@ -1,22 +1,19 @@
 import torch
-from perfusion_pytorch import Rank1EditModule, save_load, OpenClipEmbedWrapper, EmbeddingWrapper
+from perfusion_pytorch import Rank1EditModule, save_load, EmbeddingWrapper
 from perfusion_pytorch.optimizer import get_finetune_optimizer, get_finetune_parameters
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, StableDiffusionPipeline
 from PIL import Image
 from torch import nn
 from diffusers.models.attention_processor import Attention
 from transformers import CLIPTextModel, CLIPTokenizer
-import open_clip
 import os
-from torchvision.transforms.functional import pil_to_tensor 
-from torch import optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 from diffusers.image_processor import VaeImageProcessor
 
-device = "mps"
+device = "cuda:0"
 
 class PerfusionAttnProcessor(nn.Module):
     r"""
@@ -105,6 +102,19 @@ class PerfusionAttnProcessor(nn.Module):
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
 
+def _expand_mask(mask, dtype, tgt_len = None):
+    """
+    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    """
+    bsz, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+
+    inverted_mask = 1.0 - expanded_mask
+
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+
 class PerfusionModel(nn.Module):
     def __init__(self, unet, clip_model, tokenizer, superclass_string):
         super(PerfusionModel, self).__init__()
@@ -121,11 +131,10 @@ class PerfusionModel(nn.Module):
                                                max_length=tokenizer.model_max_length, 
                                                truncation=True,
                                                return_tensors='pt')['input_ids']
-        self.wrapped_embeds = EmbeddingWrapper(clip_model.get_input_embeddings(), 
+        self.wrapped_embeds = EmbeddingWrapper(self.clip_model.get_input_embeddings(), 
                                           superclass_string=self.superclass_string, 
                                           tokenize=self.l_tokenizer, 
-                                          tokenizer_pad_id=49407)
-        
+                                          tokenizer_pad_id=49407)        
         
         # self.wrapped_clip = OpenClipEmbedWrapper(self.clip_model, superclass_string=self.superclass_string)
         attention_class = PerfusionAttnProcessor
@@ -165,10 +174,9 @@ class PerfusionModel(nn.Module):
         
     def forward(self, noisy_latents, timesteps, text):
         embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = self.wrapped_embeds(text)
-        enc_with_new_concept = self.clip_model.text_model.encoder(embeds_with_new_concept).last_hidden_state
-        
+        enc_with_new_concept = self.clip_model.text_model.encoder(embeds_with_new_concept)[0]
         if embeds_with_superclass is not None:
-            enc_with_superclass = self.clip_model.text_model.encoder(embeds_with_superclass).last_hidden_state
+            enc_with_superclass = self.clip_model.text_model.encoder(embeds_with_superclass)[0]
         else:
             enc_with_superclass = embeds_with_superclass
             
@@ -238,51 +246,49 @@ def train(dataloader, model, num_steps, vae, noise_scheduler, opt):
             pbar.set_description(f"Loss: {loss.item()/len(images)}")
             i += len(images)
             
-def inference(prompt, model, scheduler, num_inference_steps, num_images=4, guidance_scale = 7.5):
-    scheduler.set_timesteps(num_inference_steps)
-    latents = torch.randn((num_images, model.unet.config.in_channels, 512 // 8, 512 // 8))
-    latents = latents * scheduler.init_noise_sigma
-    latents = latents.to(device)
-    for t in tqdm(scheduler.timesteps):
-        latent_model_input = torch.cat([latents]*2)
-        latent_model_input = scheduler.scale_model_input(latent_model_input, timestep=t)
-        with torch.no_grad():
-            t = t.to(device)
-            noise_pred = model(latent_model_input, t, [prompt]*num_images)
+# def inference(prompt, model, scheduler, num_inference_steps, num_images=4, guidance_scale = 7.5):
+#     scheduler.set_timesteps(num_inference_steps)
+#     latents = torch.randn((num_images, model.unet.config.in_channels, 512 // 8, 512 // 8))
+#     latents = latents * scheduler.init_noise_sigma
+#     latents = latents.to(device)
+#     for t in tqdm(scheduler.timesteps):
+#         latent_model_input = torch.cat([latents]*2)
+#         latent_model_input = scheduler.scale_model_input(latent_model_input, timestep=t)
+#         with torch.no_grad():
+#             t = t.to(device)
+#             noise_pred = model(latent_model_input, t, [prompt]*num_images)
         
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-        latents = scheduler.step(noise_pred, t, latents).prev_sample
+#         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+#         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+#         latents = scheduler.step(noise_pred, t, latents).prev_sample
         
-        latents = 1 / 0.18215 * latents
-    with torch.no_grad():
-        image = vae.decode(latents).sample
+#     latents = 1 / 0.18215 * latents
+#     with torch.no_grad():
+#         image = vae.decode(latents).sample
 
-    image = (image / 2 + 0.5).clamp(0, 1)
-    image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-    images = (image * 255).round().astype("uint8")
-    pil_images = [Image.fromarray(image) for image in images]
+#     image = (image / 2 + 0.5).clamp(0, 1)
+#     image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+#     images = (image * 255).round().astype("uint8")
+#     pil_images = [Image.fromarray(image) for image in images]
     
-    return pil_images
+#     return pil_images
 
-# def inference(prompts, pipe, model):
-    
-#     embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = model.wrapped_embeds(prompts)
-#     enc_with_new_concept = model.clip_model.text_model.encoder(embeds_with_new_concept).last_hidden_state
-    
-#     if embeds_with_superclass is not None:
-#         enc_with_superclass = model.clip_model.text_model.encoder(embeds_with_superclass).last_hidden_state
-#     else:
-#         enc_with_superclass = embeds_with_superclass
+def inference(prompts, pipe, model):
+    embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = model.wrapped_embeds(prompts)
+    enc_with_new_concept = model.clip_model.text_model.encoder(embeds_with_new_concept)[0]
+    if embeds_with_superclass is not None:
+        enc_with_superclass = model.clip_model.text_model.encoder(embeds_with_superclass, attention_mask=text_mask)[0]
+    else:
+        enc_with_superclass = embeds_with_superclass
 
-#     pipe.unet = model.unet
-#     pipe.text_encoder = model.clip_model
-#     pipe.to(device)
-#     images = pipe(prompt_embeds=enc_with_new_concept,
-#                  num_inference_steps=30, 
-#                  guidance_scale=7.5, 
-#                  cross_attention_kwargs={"concept_indices": concept_indices, "text_enc_with_superclass": enc_with_superclass}).images
-#     return images
+    pipe.unet = model.unet
+    pipe.text_encoder = model.clip_model
+    pipe.to(device)
+    images = pipe(prompt_embeds=enc_with_new_concept,
+                 num_inference_steps=30, 
+                 guidance_scale=7.5, 
+                 cross_attention_kwargs={"concept_indices": concept_indices, "text_enc_with_superclass": enc_with_superclass}).images
+    return images
     
     
 if __name__ == "__main__":
@@ -295,13 +301,14 @@ if __name__ == "__main__":
     # clip_model, _, _ = open_clip.create_model_and_transforms("ViT-L-14", pretrained='laion2B-s32B-b82K')
     tokenizer = CLIPTokenizer.from_pretrained(model_name, subfolder='tokenizer')
     clip_model = CLIPTextModel.from_pretrained(model_name, subfolder='text_encoder')
-    images = open_and_prepare_images("../dog")
+    images = open_and_prepare_images("./dog")
     
     dl = DataLoader(list(zip(images, ["a photo of a dog sitting"]*len(images))), 2, True)
     superclass_string = "dog"
     
     pipe = StableDiffusionPipeline.from_pretrained(model_name, requires_safety_checker=False)
-    perfusion_model = PerfusionModel(pipe.unet, pipe.text_encoder, pipe.tokenizer, superclass_string).to(device).requires_grad_(False)
+    pipe.scheduler = noise_scheduler
+    perfusion_model = PerfusionModel(unet, clip_model, tokenizer, superclass_string).to(device).requires_grad_(False)
     # for param in get_finetune_parameters(perfusion_model):
     #     param.requires_grad = True
     # opt = get_finetune_optimizer(perfusion_model)
@@ -312,8 +319,8 @@ if __name__ == "__main__":
     save_load.load(perfusion_model, 'dog_concept.pt')
     perfusion_model.eval()
     with torch.no_grad():
-        images = inference('A photo of a dog', perfusion_model, noise_scheduler, 50, 1)
-        # images = inference(['a photo of a dog wearing sunglasses, high quality'], pipe, perfusion_model)
+        # images = inference('A photo of a dog', perfusion_model, noise_scheduler, 30, 1)
+        images = inference(['a photo of a dog wearing sunglasses, high quality']*2, pipe, perfusion_model)
     # images = inference("a photo of a dog with sunglasses on", perfusion_model, noise_scheduler, 100)
     
     
