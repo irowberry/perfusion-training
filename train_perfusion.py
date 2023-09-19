@@ -238,51 +238,51 @@ def train(dataloader, model, num_steps, vae, noise_scheduler, opt):
             pbar.set_description(f"Loss: {loss.item()/len(images)}")
             i += len(images)
             
-# def inference(prompt, model, scheduler, num_inference_steps, num_images=4, guidance_scale = 7.5):
-#     scheduler.set_timesteps(num_inference_steps)
-#     latents = torch.randn((num_images, model.unet.config.in_channels, 512 // 8, 512 // 8))
-#     latents = latents * scheduler.init_noise_sigma
-#     latents = latents.to(device)
-#     for t in tqdm(scheduler.timesteps):
-#         latent_model_input = torch.cat([latents]*2)
-#         latent_model_input = scheduler.scale_model_input(latent_model_input, timestep=t)
-#         with torch.no_grad():
-#             t = t.to(device)
-#             noise_pred = model(latent_model_input, t, [prompt]*num_images)
+def inference(prompt, model, scheduler, num_inference_steps, num_images=4, guidance_scale = 7.5):
+    scheduler.set_timesteps(num_inference_steps)
+    latents = torch.randn((num_images, model.unet.config.in_channels, 512 // 8, 512 // 8))
+    latents = latents * scheduler.init_noise_sigma
+    latents = latents.to(device)
+    for t in tqdm(scheduler.timesteps):
+        latent_model_input = torch.cat([latents]*2)
+        latent_model_input = scheduler.scale_model_input(latent_model_input, timestep=t)
+        with torch.no_grad():
+            t = t.to(device)
+            noise_pred = model(latent_model_input, t, [prompt]*num_images)
         
-#         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-#         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-#         latents = scheduler.step(noise_pred, t, latents).prev_sample
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+        latents = scheduler.step(noise_pred, t, latents).prev_sample
         
-#     latents = 1 / 0.18215 * latents
-#     with torch.no_grad():
-#         image = vae.decode(latents).sample
+        latents = 1 / 0.18215 * latents
+    with torch.no_grad():
+        image = vae.decode(latents).sample
 
-#     image = (image / 2 + 0.5).clamp(0, 1)
-#     image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-#     images = (image * 255).round().astype("uint8")
-#     pil_images = [Image.fromarray(image) for image in images]
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+    images = (image * 255).round().astype("uint8")
+    pil_images = [Image.fromarray(image) for image in images]
     
-#     return pil_images
+    return pil_images
 
-def inference(prompts, pipe, model):
+# def inference(prompts, pipe, model):
     
-    embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = model.wrapped_embeds(prompts)
-    enc_with_new_concept = model.clip_model.text_model.encoder(embeds_with_new_concept).last_hidden_state
+#     embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = model.wrapped_embeds(prompts)
+#     enc_with_new_concept = model.clip_model.text_model.encoder(embeds_with_new_concept).last_hidden_state
     
-    if embeds_with_superclass is not None:
-        enc_with_superclass = model.clip_model.text_model.encoder(embeds_with_superclass).last_hidden_state
-    else:
-        enc_with_superclass = embeds_with_superclass
-    pipe.unet = model.unet
-    pipe.text_encoder = model.clip_model
-    pipe.to(device)
-    images = pipe(prompts, 
-        # prompt_embeds=enc_with_new_concept,
-                 num_inference_steps=30, 
-                 guidance_scale=7.5, 
-                 cross_attention_kwargs={"concept_indices": concept_indices, "text_enc_with_superclass": enc_with_superclass}).images
-    return images
+#     if embeds_with_superclass is not None:
+#         enc_with_superclass = model.clip_model.text_model.encoder(embeds_with_superclass).last_hidden_state
+#     else:
+#         enc_with_superclass = embeds_with_superclass
+
+#     pipe.unet = model.unet
+#     pipe.text_encoder = model.clip_model
+#     pipe.to(device)
+#     images = pipe(prompt_embeds=enc_with_new_concept,
+#                  num_inference_steps=30, 
+#                  guidance_scale=7.5, 
+#                  cross_attention_kwargs={"concept_indices": concept_indices, "text_enc_with_superclass": enc_with_superclass}).images
+#     return images
     
     
 if __name__ == "__main__":
@@ -300,19 +300,20 @@ if __name__ == "__main__":
     dl = DataLoader(list(zip(images, ["a photo of a dog sitting"]*len(images))), 2, True)
     superclass_string = "dog"
     
-    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", requires_safety_checker=False)
+    pipe = StableDiffusionPipeline.from_pretrained(model_name, requires_safety_checker=False)
     perfusion_model = PerfusionModel(pipe.unet, pipe.text_encoder, pipe.tokenizer, superclass_string).to(device).requires_grad_(False)
     # for param in get_finetune_parameters(perfusion_model):
     #     param.requires_grad = True
     # opt = get_finetune_optimizer(perfusion_model)
     
-    perfusion_model.train()
+    # perfusion_model.train()
     # train(dl, perfusion_model, 1200, vae, noise_scheduler, opt)
     # save_load.save(perfusion_model, 'dog_concept.pt')
     save_load.load(perfusion_model, 'dog_concept.pt')
     perfusion_model.eval()
     with torch.no_grad():
-        images = inference(['a photo of a dog wearing sunglasses, high quality'], pipe, perfusion_model)
+        images = inference('A photo of a dog', perfusion_model, noise_scheduler, 50, 1)
+        # images = inference(['a photo of a dog wearing sunglasses, high quality'], pipe, perfusion_model)
     # images = inference("a photo of a dog with sunglasses on", perfusion_model, noise_scheduler, 100)
     
     
