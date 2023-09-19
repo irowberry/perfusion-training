@@ -16,7 +16,7 @@ from tqdm import tqdm
 import numpy as np
 from diffusers.image_processor import VaeImageProcessor
 
-device = "cuda:0"
+device = "mps"
 
 class PerfusionAttnProcessor(nn.Module):
     r"""
@@ -265,15 +265,23 @@ def train(dataloader, model, num_steps, vae, noise_scheduler, opt):
     
 #     return pil_images
 
-def inference(prompts, pipe, perfusion_model):
-    _, superclass_enc, _, indices = perfusion_model.wrapped_embeds(prompts)
-    pipe.unet = perfusion_model.unet
-    pipe.text_encoder = perfusion_model.clip_model
+def inference(prompts, pipe, model):
+    
+    embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = model.wrapped_embeds(prompts)
+    enc_with_new_concept = model.clip_model.text_model.encoder(embeds_with_new_concept).last_hidden_state
+    
+    if embeds_with_superclass is not None:
+        enc_with_superclass = model.clip_model.text_model.encoder(embeds_with_superclass).last_hidden_state
+    else:
+        enc_with_superclass = embeds_with_superclass
+    pipe.unet = model.unet
+    pipe.text_encoder = model.clip_model
     pipe.to(device)
     images = pipe(prompts, 
+        # prompt_embeds=enc_with_new_concept,
                  num_inference_steps=30, 
                  guidance_scale=7.5, 
-                 cross_attention_kwargs={"concept_indices": indices, "text_enc_with_superclass": superclass_enc}).images
+                 cross_attention_kwargs={"concept_indices": concept_indices, "text_enc_with_superclass": enc_with_superclass}).images
     return images
     
     
@@ -292,18 +300,19 @@ if __name__ == "__main__":
     dl = DataLoader(list(zip(images, ["a photo of a dog sitting"]*len(images))), 2, True)
     superclass_string = "dog"
     
-    perfusion_model = PerfusionModel(unet, clip_model, tokenizer, superclass_string).to(device).requires_grad_(False)
-    for param in get_finetune_parameters(perfusion_model):
-        param.requires_grad = True
-    opt = get_finetune_optimizer(perfusion_model)
+    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", requires_safety_checker=False)
+    perfusion_model = PerfusionModel(pipe.unet, pipe.text_encoder, pipe.tokenizer, superclass_string).to(device).requires_grad_(False)
+    # for param in get_finetune_parameters(perfusion_model):
+    #     param.requires_grad = True
+    # opt = get_finetune_optimizer(perfusion_model)
     
     perfusion_model.train()
-    train(dl, perfusion_model, 1200, vae, noise_scheduler, opt)
-    save_load.save(perfusion_model, 'dog_concept.pt')   
-    # save_load.load(perfusion_model, 'dog_concept.pt')
+    # train(dl, perfusion_model, 1200, vae, noise_scheduler, opt)
+    # save_load.save(perfusion_model, 'dog_concept.pt')
+    save_load.load(perfusion_model, 'dog_concept.pt')
     perfusion_model.eval()
-    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", requires_safety_checker=False)
-    images = inference(['a photo of a dog, high quality']*4, pipe, perfusion_model)
+    with torch.no_grad():
+        images = inference(['a photo of a dog wearing sunglasses, high quality'], pipe, perfusion_model)
     # images = inference("a photo of a dog with sunglasses on", perfusion_model, noise_scheduler, 100)
     
     
