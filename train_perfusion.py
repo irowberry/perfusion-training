@@ -12,8 +12,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 from diffusers.image_processor import VaeImageProcessor
+from transformers.models.clip.modeling_clip import _make_causal_mask, _expand_mask
 
-device = "mps"
+device = "cuda:0"
 
 class PerfusionAttnProcessor(nn.Module):
     r"""
@@ -119,13 +120,14 @@ class PerfusionModel(nn.Module):
                                                max_length=tokenizer.model_max_length, 
                                                truncation=True,
                                                return_tensors='pt')['input_ids']
-        self.l_encoder = lambda x: self.clip_model.text_model.encoder(x)[0]
+        self.l_encoder = lambda x: self.clip_model.text_model.final_layer_norm(self.clip_model.text_model.encoder(x)[0])
         self.wrapped_embeds = EmbeddingWrapper(self.clip_model.get_input_embeddings(), 
                                           superclass_string=self.superclass_string, 
                                           tokenize=self.l_tokenizer,
+                                        #   tokenizer_pad_id=0,
                                           tokenizer_pad_id=49407,
-                                          )        
-        
+                                          )
+
         # self.wrapped_clip = OpenClipEmbedWrapper(self.clip_model, superclass_string=self.superclass_string)
         attention_class = PerfusionAttnProcessor
 
@@ -162,38 +164,48 @@ class PerfusionModel(nn.Module):
         del st
         self.unet.set_attn_processor(self.custom_diffusion_attn_procs)
         
-    def forward(self, noisy_latents, timesteps, text):
-        # embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = self.wrapped_embeds(text, clip_transformer_fn=self.l_encoder)
-        # enc_with_new_concept = self.clip_model.text_model.encoder(embeds_with_new_concept)[0]
-        # if embeds_with_superclass is not None:
-        #     enc_with_superclass = self.clip_model.text_model.encoder(embeds_with_superclass)[0]
-        # else:
-        #     enc_with_superclass = embeds_with_superclass
-        
-        enc_with_new_concept, enc_with_superclass, embed_mask, concept_indices = self.wrapped_embeds(text, clip_transformer_fn=self.l_encoder)
-            
-        if self.training:
-            out = self.unet(noisy_latents, 
-                            timesteps, 
-                            enc_with_new_concept,
-                            cross_attention_kwargs={
-                                'text_enc_with_superclass': enc_with_superclass,
-                                'concept_indices': concept_indices,
-                                },
-                            attention_mask=embed_mask,
-                            )
+    def prepare_encodings(self, text):
+        ids_size = self.l_tokenizer(text).size()
+        embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = self.wrapped_embeds(text)
+        text_mask = _expand_mask(embed_mask, embeds_with_new_concept.dtype)
+        causal_mask = _make_causal_mask(ids_size, embeds_with_new_concept.dtype, embeds_with_new_concept.device)
+        enc_with_new_concept = self.clip_model.text_model.encoder(embeds_with_new_concept, text_mask, causal_mask)[0]
+        enc_with_new_concept = self.clip_model.text_model.final_layer_norm(enc_with_new_concept)
+        if embeds_with_superclass is not None:
+            enc_with_superclass = self.clip_model.text_model.encoder(embeds_with_superclass)[0]
+            enc_with_superclass = self.clip_model.text_model.final_layer_norm(enc_with_superclass)
         else:
-            uncond_ids = self.l_tokenizer([""]*enc_with_new_concept.shape[0])
-            uncond_enc = self.clip_model(uncond_ids.to(noisy_latents.device))[0]
-            out = self.unet(noisy_latents, 
-                            timesteps, 
-                            torch.cat([uncond_enc, enc_with_new_concept]),
-                            cross_attention_kwargs={
-                                'text_enc_with_superclass': enc_with_superclass,
-                                'concept_indices': concept_indices,
-                                },
-                            attention_mask=torch.cat([embed_mask, torch.ones_like(embed_mask, dtype=embed_mask.dtype)])
-                            )
+            enc_with_superclass = embeds_with_superclass
+            
+        return enc_with_new_concept, embeds_with_superclass, embed_mask, concept_indices
+        
+    def forward(self, noisy_latents, timesteps, text):
+        
+        enc_with_new_concept, enc_with_superclass, embed_mask, concept_indices = self.prepare_encodings(text)
+        # enc_with_new_concept, enc_with_superclass, embed_mask, concept_indices = self.wrapped_embeds(text, clip_transformer_fn=self.l_encoder)
+            
+        # if self.training:
+        out = self.unet(noisy_latents, 
+                        timesteps, 
+                        enc_with_new_concept,
+                        cross_attention_kwargs={
+                            'text_enc_with_superclass': enc_with_superclass,
+                            'concept_indices': concept_indices,
+                            },
+                        attention_mask=embed_mask,
+                        )
+        # else:
+        #     uncond_ids = self.l_tokenizer([""]*enc_with_new_concept.shape[0])
+        #     uncond_enc = self.clip_model(uncond_ids.to(noisy_latents.device))[0]
+        #     out = self.unet(noisy_latents, 
+        #                     timesteps, 
+        #                     torch.cat([uncond_enc, enc_with_new_concept]),
+        #                     cross_attention_kwargs={
+        #                         'text_enc_with_superclass': enc_with_superclass,
+        #                         'concept_indices': concept_indices,
+        #                         },
+        #                     attention_mask=torch.cat([embed_mask, torch.ones_like(embed_mask, dtype=embed_mask.dtype)])
+        #                     )
         return out.sample
 
 def open_and_prepare_images(dir):
@@ -272,7 +284,9 @@ def inference(prompts, pipe, model):
     #     enc_with_superclass = model.clip_model.text_model.encoder(embeds_with_superclass)[0]
     # else:
     #     enc_with_superclass = embeds_with_superclass
-    enc_with_new_concept, enc_with_superclass, embed_mask, concept_indices = model.wrapped_embeds(prompts, clip_transformer_fn=model.l_encoder)
+    # enc_with_new_concept, enc_with_superclass, embed_mask, concept_indices = model.wrapped_embeds(prompts, clip_transformer_fn=model.l_encoder)
+    enc_with_new_concept, enc_with_superclass, embed_mask, concept_indices = model.prepare_encodings(prompts)
+    
 
     pipe.unet = model.unet
     pipe.text_encoder = model.clip_model
@@ -302,19 +316,17 @@ if __name__ == "__main__":
     pipe = StableDiffusionPipeline.from_pretrained(model_name, requires_safety_checker=False)
     pipe.scheduler = noise_scheduler
     perfusion_model = PerfusionModel(unet, clip_model, tokenizer, superclass_string).to(device).requires_grad_(False)
-    # for param in get_finetune_parameters(perfusion_model):
-    #     param.requires_grad = True
-    # opt = get_finetune_optimizer(perfusion_model)
+    for param in get_finetune_parameters(perfusion_model):
+        param.requires_grad = True
+    opt = get_finetune_optimizer(perfusion_model)
     
-    # perfusion_model.train()
-    # train(dl, perfusion_model, 1200, vae, noise_scheduler, opt)
-    # save_load.save(perfusion_model, 'dog_concept.pt')
-    save_load.load(perfusion_model, 'dog_concept.pt')
+    perfusion_model.train()
+    train(dl, perfusion_model, 1500, vae, noise_scheduler, opt)
+    save_load.save(perfusion_model, 'dog_concept.pt')
+    # save_load.load(perfusion_model, 'dog_concept.pt')
     perfusion_model.eval()
     with torch.no_grad():
-        # images = inference('A photo of a dog', perfusion_model, noise_scheduler, 30, 1)
-        images = inference(['a photo of a dog wearing sunglasses, high quality'], pipe, perfusion_model)
-    # images = inference("a photo of a dog with sunglasses on", perfusion_model, noise_scheduler, 100)
+        images = inference(['a photo of a dog with sunglasses']*4, pipe, perfusion_model)
     
     
     for i, img in enumerate(images):
