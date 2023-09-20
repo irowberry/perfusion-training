@@ -13,7 +13,7 @@ from tqdm import tqdm
 import numpy as np
 from diffusers.image_processor import VaeImageProcessor
 
-device = "cuda:0"
+device = "cpu"
 
 class PerfusionAttnProcessor(nn.Module):
     r"""
@@ -102,18 +102,6 @@ class PerfusionAttnProcessor(nn.Module):
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
 
-def _expand_mask(mask, dtype, tgt_len = None):
-    """
-    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
-    """
-    bsz, src_len = mask.size()
-    tgt_len = tgt_len if tgt_len is not None else src_len
-
-    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
-
-    inverted_mask = 1.0 - expanded_mask
-
-    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 class PerfusionModel(nn.Module):
     def __init__(self, unet, clip_model, tokenizer, superclass_string):
@@ -131,10 +119,12 @@ class PerfusionModel(nn.Module):
                                                max_length=tokenizer.model_max_length, 
                                                truncation=True,
                                                return_tensors='pt')['input_ids']
+        self.l_encoder = lambda x: self.clip_model.text_model.encoder(x)[0]
         self.wrapped_embeds = EmbeddingWrapper(self.clip_model.get_input_embeddings(), 
                                           superclass_string=self.superclass_string, 
-                                          tokenize=self.l_tokenizer, 
-                                          tokenizer_pad_id=49407)        
+                                          tokenize=self.l_tokenizer,
+                                          tokenizer_pad_id=49407,
+                                          )        
         
         # self.wrapped_clip = OpenClipEmbedWrapper(self.clip_model, superclass_string=self.superclass_string)
         attention_class = PerfusionAttnProcessor
@@ -173,12 +163,14 @@ class PerfusionModel(nn.Module):
         self.unet.set_attn_processor(self.custom_diffusion_attn_procs)
         
     def forward(self, noisy_latents, timesteps, text):
-        embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = self.wrapped_embeds(text)
-        enc_with_new_concept = self.clip_model.text_model.encoder(embeds_with_new_concept)[0]
-        if embeds_with_superclass is not None:
-            enc_with_superclass = self.clip_model.text_model.encoder(embeds_with_superclass)[0]
-        else:
-            enc_with_superclass = embeds_with_superclass
+        # embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = self.wrapped_embeds(text, clip_transformer_fn=self.l_encoder)
+        # enc_with_new_concept = self.clip_model.text_model.encoder(embeds_with_new_concept)[0]
+        # if embeds_with_superclass is not None:
+        #     enc_with_superclass = self.clip_model.text_model.encoder(embeds_with_superclass)[0]
+        # else:
+        #     enc_with_superclass = embeds_with_superclass
+        
+        enc_with_new_concept, enc_with_superclass, embed_mask, concept_indices = self.wrapped_embeds(text, clip_transformer_fn=self.l_encoder)
             
         if self.training:
             out = self.unet(noisy_latents, 
@@ -274,12 +266,13 @@ def train(dataloader, model, num_steps, vae, noise_scheduler, opt):
 #     return pil_images
 
 def inference(prompts, pipe, model):
-    embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = model.wrapped_embeds(prompts)
-    enc_with_new_concept = model.clip_model.text_model.encoder(embeds_with_new_concept)[0]
-    if embeds_with_superclass is not None:
-        enc_with_superclass = model.clip_model.text_model.encoder(embeds_with_superclass, attention_mask=text_mask)[0]
-    else:
-        enc_with_superclass = embeds_with_superclass
+    # embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = model.wrapped_embeds(prompts, clip_transformer_fn=model.l_encoder)
+    # enc_with_new_concept = model.clip_model.text_model.encoder(embeds_with_new_concept)[0]
+    # if embeds_with_superclass is not None:
+    #     enc_with_superclass = model.clip_model.text_model.encoder(embeds_with_superclass)[0]
+    # else:
+    #     enc_with_superclass = embeds_with_superclass
+    enc_with_new_concept, enc_with_superclass, embed_mask, concept_indices = model.wrapped_embeds(prompts, clip_transformer_fn=model.l_encoder)
 
     pipe.unet = model.unet
     pipe.text_encoder = model.clip_model
@@ -320,7 +313,7 @@ if __name__ == "__main__":
     perfusion_model.eval()
     with torch.no_grad():
         # images = inference('A photo of a dog', perfusion_model, noise_scheduler, 30, 1)
-        images = inference(['a photo of a dog wearing sunglasses, high quality']*2, pipe, perfusion_model)
+        images = inference(['a photo of a dog wearing sunglasses, high quality'], pipe, perfusion_model)
     # images = inference("a photo of a dog with sunglasses on", perfusion_model, noise_scheduler, 100)
     
     
