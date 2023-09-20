@@ -109,7 +109,6 @@ class PerfusionModel(nn.Module):
         super(PerfusionModel, self).__init__()
         self.unet = unet
         self.clip_model = clip_model
-        train_kv = True
         self.superclass_string = superclass_string
         self.custom_diffusion_attn_procs = {}
         
@@ -121,6 +120,7 @@ class PerfusionModel(nn.Module):
                                                truncation=True,
                                                return_tensors='pt')['input_ids']
         self.l_encoder = lambda x: self.clip_model.text_model.final_layer_norm(self.clip_model.text_model.encoder(x)[0])
+
         self.wrapped_embeds = EmbeddingWrapper(self.clip_model.get_input_embeddings(), 
                                           superclass_string=self.superclass_string, 
                                           tokenize=self.l_tokenizer,
@@ -150,7 +150,7 @@ class PerfusionModel(nn.Module):
             }
             if cross_attention_dim is not None:
                 self.custom_diffusion_attn_procs[name] = attention_class(
-                    train_kv=train_kv,
+                    train_kv=True,
                     hidden_size=hidden_size,
                     cross_attention_dim=cross_attention_dim,
                 ).to(self.unet.device)
@@ -165,19 +165,19 @@ class PerfusionModel(nn.Module):
         self.unet.set_attn_processor(self.custom_diffusion_attn_procs)
         
     def prepare_encodings(self, text):
-        ids_size = self.l_tokenizer(text).size()
         embeds_with_new_concept, embeds_with_superclass, embed_mask, concept_indices = self.wrapped_embeds(text)
         text_mask = _expand_mask(embed_mask, embeds_with_new_concept.dtype)
+        ids_size = self.l_tokenizer(text).size()
         causal_mask = _make_causal_mask(ids_size, embeds_with_new_concept.dtype, embeds_with_new_concept.device)
         enc_with_new_concept = self.clip_model.text_model.encoder(embeds_with_new_concept, text_mask, causal_mask)[0]
         enc_with_new_concept = self.clip_model.text_model.final_layer_norm(enc_with_new_concept)
         if embeds_with_superclass is not None:
-            enc_with_superclass = self.clip_model.text_model.encoder(embeds_with_superclass)[0]
+            enc_with_superclass = self.clip_model.text_model.encoder(embeds_with_superclass, text_mask, causal_mask)[0]
             enc_with_superclass = self.clip_model.text_model.final_layer_norm(enc_with_superclass)
         else:
             enc_with_superclass = embeds_with_superclass
             
-        return enc_with_new_concept, embeds_with_superclass, embed_mask, concept_indices
+        return enc_with_new_concept, enc_with_superclass, embed_mask,  concept_indices
         
     def forward(self, noisy_latents, timesteps, text):
         
@@ -292,7 +292,7 @@ def inference(prompts, pipe, model):
     pipe.text_encoder = model.clip_model
     pipe.to(device)
     images = pipe(prompt_embeds=enc_with_new_concept,
-                 num_inference_steps=30, 
+                 num_inference_steps=50, 
                  guidance_scale=7.5, 
                  cross_attention_kwargs={"concept_indices": concept_indices, "text_enc_with_superclass": enc_with_superclass}).images
     return images
@@ -316,17 +316,17 @@ if __name__ == "__main__":
     pipe = StableDiffusionPipeline.from_pretrained(model_name, requires_safety_checker=False)
     pipe.scheduler = noise_scheduler
     perfusion_model = PerfusionModel(unet, clip_model, tokenizer, superclass_string).to(device).requires_grad_(False)
-    for param in get_finetune_parameters(perfusion_model):
-        param.requires_grad = True
-    opt = get_finetune_optimizer(perfusion_model)
+    # for param in get_finetune_parameters(perfusion_model):
+    #     param.requires_grad = True
+    # opt = get_finetune_optimizer(perfusion_model)
     
-    perfusion_model.train()
-    train(dl, perfusion_model, 1500, vae, noise_scheduler, opt)
-    save_load.save(perfusion_model, 'dog_concept.pt')
-    # save_load.load(perfusion_model, 'dog_concept.pt')
+    # perfusion_model.train()
+    # train(dl, perfusion_model, 1500, vae, noise_scheduler, opt)
+    # save_load.save(perfusion_model, 'dog_concept.pt')
+    save_load.load(perfusion_model, 'dog_concept.pt')
     perfusion_model.eval()
     with torch.no_grad():
-        images = inference(['a photo of a dog with sunglasses']*4, pipe, perfusion_model)
+        images = inference(['a photo of a dog']*4, pipe, perfusion_model)
     
     
     for i, img in enumerate(images):
