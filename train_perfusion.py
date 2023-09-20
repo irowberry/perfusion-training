@@ -13,7 +13,7 @@ from tqdm import tqdm
 import numpy as np
 from diffusers.image_processor import VaeImageProcessor
 
-device = "cpu"
+device = "mps"
 
 class PerfusionAttnProcessor(nn.Module):
     r"""
