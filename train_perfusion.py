@@ -15,7 +15,7 @@ from diffusers.image_processor import VaeImageProcessor
 from transformers.models.clip.modeling_clip import _make_causal_mask, _expand_mask
 
 device = "cuda:0"
-generator = torch.Generator(device=device).manual_seed(12345)
+generator = torch.Generator(device='cpu').manual_seed(12345)
 
 class PerfusionAttnProcessor(nn.Module):
     r"""
@@ -107,7 +107,7 @@ class PerfusionAttnProcessor(nn.Module):
 
 class PerfusionModel(nn.Module):
     def __init__(self, unet, clip_model, tokenizer, superclass_string):
-        super(PerfusionModel, self).__init__()
+        super().__init__()
         self.unet = unet
         self.clip_model = clip_model
         self.superclass_string = superclass_string
@@ -253,7 +253,7 @@ def train(dataloader, model, num_steps, vae, noise_scheduler, opt):
             pbar.set_description(f"Loss: {loss.item()/len(images)}")
             i += len(images)
             
-def manual_inference(prompt, model, scheduler, num_inference_steps, num_images=4, guidance_scale = 7.5):
+def manual_inference(prompt, model, scheduler, vae, num_inference_steps, num_images=4, guidance_scale = 7.5):
     scheduler.set_timesteps(num_inference_steps)
     latents = torch.randn((num_images, model.unet.config.in_channels, 512 // 8, 512 // 8), generator=generator)
     latents = latents * scheduler.init_noise_sigma
@@ -284,12 +284,12 @@ def pipe_inference(prompts, pipe, model, num_inference_steps=30):
     enc_with_new_concept, enc_with_superclass, embed_mask, concept_indices = model.prepare_encodings(prompts)
 
     pipe.unet = model.unet
-    pipe.text_encoder = model.clip_model
+    # pipe.text_encoder = model.clip_model
     pipe.to(device)
     images = pipe(prompt_embeds=enc_with_new_concept,
                  num_inference_steps=num_inference_steps, 
                  guidance_scale=7.5,
-                 generator=generator,
+                #  generator=generator,
                  cross_attention_kwargs={"concept_indices": concept_indices, "text_enc_with_superclass": enc_with_superclass}).images
     return images
     
@@ -297,40 +297,43 @@ def pipe_inference(prompts, pipe, model, num_inference_steps=30):
 if __name__ == "__main__":
     model_name = "runwayml/stable-diffusion-v1-5"
     
-    vae = AutoencoderKL.from_pretrained(model_name, subfolder='vae').to(device)
-    unet = UNet2DConditionModel.from_pretrained(model_name, subfolder="unet")
-    # noise_scheduler = LMSDiscreteScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
+    # vae = AutoencoderKL.from_pretrained(model_name, subfolder='vae').to(device)
+    # unet = UNet2DConditionModel.from_pretrained(model_name, subfolder="unet")
+    # # noise_scheduler = LMSDiscreteScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
     noise_scheduler = DDPMScheduler.from_pretrained(model_name, subfolder="scheduler")
-    # clip_model, _, _ = open_clip.create_model_and_transforms("ViT-L-14", pretrained='laion2B-s32B-b82K')
-    tokenizer = CLIPTokenizer.from_pretrained(model_name, subfolder='tokenizer')
-    clip_model = CLIPTextModel.from_pretrained(model_name, subfolder='text_encoder')
+    # # clip_model, _, _ = open_clip.create_model_and_transforms("ViT-L-14", pretrained='laion2B-s32B-b82K')
+    # tokenizer = CLIPTokenizer.from_pretrained(model_name, subfolder='tokenizer')
+    # clip_model = CLIPTextModel.from_pretrained(model_name, subfolder='text_encoder')
     images = open_and_prepare_images("./dog")
     
     dl = DataLoader(list(zip(images, ["a photo of a dog sitting"]*len(images))), 2, True)
     superclass_string = "dog"
     
-    pipe = StableDiffusionPipeline.from_pretrained(model_name, requires_safety_checker=False)
-    perfusion_model = PerfusionModel(unet, clip_model, tokenizer, superclass_string).to(device).requires_grad_(False)
-    # for param in get_finetune_parameters(perfusion_model):
-    #     param.requires_grad = True
-    # opt = get_finetune_optimizer(perfusion_model)
-    
-    # perfusion_model.train()
-    # train(dl, perfusion_model, 1500, vae, noise_scheduler, opt)
-    # save_load.save(perfusion_model, 'dog_concept.pt')
-    save_load.load(perfusion_model, 'dog_concept.pt')
+    pipe = StableDiffusionPipeline.from_pretrained(model_name, requires_safety_checker=False, device=device)
+    pipe.scheduler = noise_scheduler
+    pipe.vae = pipe.vae.to(device)
+    perfusion_model = PerfusionModel(pipe.unet, pipe.text_encoder, pipe.tokenizer, superclass_string).to(device).requires_grad_(False)
+    for param in get_finetune_parameters(perfusion_model):
+        param.requires_grad = True
+    opt = get_finetune_optimizer(perfusion_model)
+    perfusion_model.train()
+    train(dl, perfusion_model, 1500, pipe.vae, pipe.scheduler, opt)
+    save_load.save(perfusion_model, 'dog_concept.pt')
+    # save_load.load(perfusion_model, 'dog_concept.pt')
+    prompt = "a photo of a dog"
     perfusion_model.eval()
     with torch.no_grad():
-        images = manual_inference("a photo of a dog", 
+        images = manual_inference(prompt, 
                            perfusion_model, 
-                           noise_scheduler, 
+                           pipe.scheduler,
+                           pipe.vae,
                            30, 
                            num_images=1, 
                            guidance_scale=7.5)
         for i, img in enumerate(images):
             img.save(f"manual_inference_{i}.jpg")
 
-        images = pipe_inference(['a photo of a dog'], pipe, perfusion_model)
+        images = pipe_inference([prompt], pipe, perfusion_model)
         for i, img in enumerate(images):
             img.save(f"pipe_inference_{i}.jpg")
     
